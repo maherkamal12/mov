@@ -3,35 +3,42 @@ import { movies, categories, movieCategories, scrapingLog } from "@/db/schema";
 import { scrapeMoviesPage, SOURCE_CATEGORIES, type ScrapedMovie } from "@/lib/scraper";
 import { eq, and, sql } from "drizzle-orm";
 
+/** Throw if database is not available. */
+function requireDb() {
+  if (!db) throw new Error("Database is not configured. Set DATABASE_URL environment variable.");
+  return db;
+}
+
 /** Upsert a single category into the DB. */
 async function upsertCategory(slug: string, name: string, nameAr: string, totalPages: number) {
-  const existing = await db
+  const d = requireDb();
+  const existing = await d
     .select()
     .from(categories)
     .where(eq(categories.slug, slug))
     .limit(1);
 
   if (existing.length > 0) {
-    await db
+    await d
       .update(categories)
       .set({ name, nameAr, totalPages, updatedAt: new Date() })
       .where(eq(categories.slug, slug));
   } else {
-    await db.insert(categories).values({ slug, name, nameAr, totalPages });
+    await d.insert(categories).values({ slug, name, nameAr, totalPages });
   }
 }
 
 /** Upsert a movie and its category link. */
 async function upsertMovie(movie: ScrapedMovie, categorySlug: string, position: number) {
-  // Insert movie if not exists
-  const existing = await db
+  const d = requireDb();
+  const existing = await d
     .select({ vid: movies.vid })
     .from(movies)
     .where(eq(movies.vid, movie.vid))
     .limit(1);
 
   if (existing.length === 0) {
-    await db.insert(movies).values({
+    await d.insert(movies).values({
       vid: movie.vid,
       title: movie.title,
       image: movie.image,
@@ -40,7 +47,7 @@ async function upsertMovie(movie: ScrapedMovie, categorySlug: string, position: 
       sourceUrl: movie.sourceUrl,
     });
   } else {
-    await db
+    await d
       .update(movies)
       .set({
         title: movie.title,
@@ -52,8 +59,7 @@ async function upsertMovie(movie: ScrapedMovie, categorySlug: string, position: 
       .where(eq(movies.vid, movie.vid));
   }
 
-  // Insert category link if not exists
-  const linkExists = await db
+  const linkExists = await d
     .select()
     .from(movieCategories)
     .where(
@@ -65,7 +71,7 @@ async function upsertMovie(movie: ScrapedMovie, categorySlug: string, position: 
     .limit(1);
 
   if (linkExists.length === 0) {
-    await db.insert(movieCategories).values({
+    await d.insert(movieCategories).values({
       movieVid: movie.vid,
       categorySlug,
       position,
@@ -78,21 +84,20 @@ export async function syncCategoryPage(
   categorySlug: string,
   page: number
 ): Promise<{ count: number; totalPages: number }> {
+  requireDb();
   const catInfo = SOURCE_CATEGORIES.find((c) => c.slug === categorySlug);
   if (!catInfo) throw new Error(`Unknown category: ${categorySlug}`);
 
   const result = await scrapeMoviesPage(categorySlug, page);
 
-  // Upsert category with total pages
   await upsertCategory(categorySlug, catInfo.name, catInfo.nameAr, result.totalPages);
 
-  // Upsert all movies
   for (let i = 0; i < result.movies.length; i++) {
     await upsertMovie(result.movies[i], categorySlug, (page - 1) * 40 + i);
   }
 
-  // Log
-  await db.insert(scrapingLog).values({
+  const d = requireDb();
+  await d.insert(scrapingLog).values({
     categorySlug,
     page,
     moviesCount: result.movies.length,
@@ -106,11 +111,10 @@ export async function syncFullCategory(
   categorySlug: string,
   onProgress?: (page: number, totalPages: number) => void
 ): Promise<{ totalMovies: number; totalPages: number }> {
-  // First page to get totalPages
+  requireDb();
   const first = await syncCategoryPage(categorySlug, 1);
   onProgress?.(1, first.totalPages);
 
-  // Remaining pages
   for (let p = 2; p <= first.totalPages; p++) {
     try {
       await syncCategoryPage(categorySlug, p);
@@ -129,8 +133,9 @@ export async function getCategoryMoviesFromDB(
   page: number = 1,
   perPage: number = 40
 ): Promise<{ movies: ScrapedMovie[]; total: number; totalPages: number }> {
-  // Get total count
-  const countResult = await db
+  const d = requireDb();
+
+  const countResult = await d
     .select({ count: sql<number>`count(*)::int` })
     .from(movieCategories)
     .where(eq(movieCategories.categorySlug, categorySlug));
@@ -139,8 +144,7 @@ export async function getCategoryMoviesFromDB(
   const totalPages = Math.max(1, Math.ceil(total / perPage));
   const offset = (page - 1) * perPage;
 
-  // Get movies joined with movie data, sorted by year desc
-  const rows = await db
+  const rows = await d
     .select({
       vid: movies.vid,
       title: movies.title,
@@ -172,11 +176,12 @@ export async function getCategoryMoviesFromDB(
 
 /** Get overall stats. */
 export async function getDBStats() {
-  const movieCount = await db.select({ count: sql<number>`count(*)::int` }).from(movies);
-  const catCount = await db.select({ count: sql<number>`count(*)::int` }).from(categories);
-  const linkCount = await db.select({ count: sql<number>`count(*)::int` }).from(movieCategories);
+  const d = requireDb();
+  const movieCount = await d.select({ count: sql<number>`count(*)::int` }).from(movies);
+  const catCount = await d.select({ count: sql<number>`count(*)::int` }).from(categories);
+  const linkCount = await d.select({ count: sql<number>`count(*)::int` }).from(movieCategories);
 
-  const catStats = await db
+  const catStats = await d
     .select({
       slug: categories.slug,
       nameAr: categories.nameAr,

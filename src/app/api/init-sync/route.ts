@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { isDbAvailable } from "@/db";
 import { syncCategoryPage, getDBStats } from "@/lib/syncService";
 import { SOURCE_CATEGORIES } from "@/lib/scraper";
 
@@ -7,9 +8,16 @@ export const dynamic = "force-dynamic";
 /**
  * GET /api/init-sync
  * Syncs the first page of EVERY category to populate the homepage quickly.
- * The full sync (all pages) should be triggered separately per category.
  */
 export async function GET() {
+  if (!isDbAvailable()) {
+    return NextResponse.json({
+      success: false,
+      error: "Database is not configured. Set DATABASE_URL.",
+      data: { totalMovies: 0, totalCategories: 0, totalLinks: 0 },
+    });
+  }
+
   try {
     const stats = await getDBStats();
 

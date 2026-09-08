@@ -1,4 +1,5 @@
 import { SOURCE_CATEGORIES, type ScrapedMovie } from "@/lib/scraper";
+import { isDbAvailable } from "@/db";
 import { getCategoryMoviesFromDB } from "@/lib/syncService";
 import HomeClient from "./HomeClient";
 
@@ -16,26 +17,29 @@ const HOMEPAGE_CATEGORIES = SOURCE_CATEGORIES.map((c) => c.slug);
 export default async function Home() {
   const categoryRows: CategoryRow[] = [];
 
-  // Fetch movies for each category (DB first, then live fallback)
+  const dbReady = isDbAvailable();
+
   const results = await Promise.allSettled(
     HOMEPAGE_CATEGORIES.map(async (slug) => {
       const cat = SOURCE_CATEGORIES.find((c) => c.slug === slug);
       if (!cat) return null;
 
-      try {
-        // Try DB first
-        const dbResult = await getCategoryMoviesFromDB(slug, 1, 20);
-        if (dbResult.movies.length > 0) {
-          return {
-            slug,
-            name: cat.name,
-            nameAr: cat.nameAr,
-            movies: dbResult.movies,
-            totalMovies: dbResult.total,
-          };
+      // Try DB first if available
+      if (dbReady) {
+        try {
+          const dbResult = await getCategoryMoviesFromDB(slug, 1, 20);
+          if (dbResult.movies.length > 0) {
+            return {
+              slug,
+              name: cat.name,
+              nameAr: cat.nameAr,
+              movies: dbResult.movies,
+              totalMovies: dbResult.total,
+            };
+          }
+        } catch {
+          // DB query failed
         }
-      } catch {
-        // DB not ready
       }
 
       // Fallback: live scrape

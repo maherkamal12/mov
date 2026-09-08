@@ -1,6 +1,6 @@
-import { NextRequest } from "next/server";
-import { getCategoryMoviesFromDB } from "@/lib/syncService";
 import { scrapeMoviesPage, SOURCE_CATEGORIES, type ScrapedMovie } from "@/lib/scraper";
+import { isDbAvailable } from "@/db";
+import { getCategoryMoviesFromDB } from "@/lib/syncService";
 import CategoryClient from "./CategoryClient";
 
 interface PageProps {
@@ -29,14 +29,16 @@ export default async function CategoryPage({ params, searchParams }: PageProps) 
   let totalPages = 1;
 
   // Try DB first
-  try {
-    const dbResult = await getCategoryMoviesFromDB(slug, page, 40);
-    if (dbResult.movies.length > 0) {
-      movies = dbResult.movies;
-      totalPages = dbResult.totalPages;
+  if (isDbAvailable()) {
+    try {
+      const dbResult = await getCategoryMoviesFromDB(slug, page, 40);
+      if (dbResult.movies.length > 0) {
+        movies = dbResult.movies;
+        totalPages = dbResult.totalPages;
+      }
+    } catch {
+      // DB not ready
     }
-  } catch {
-    // DB not ready
   }
 
   // Fallback: live scrape

@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { scrapeMoviesPage } from "@/lib/scraper";
+import { isDbAvailable } from "@/db";
 import { getCategoryMoviesFromDB } from "@/lib/syncService";
 
 export const dynamic = "force-dynamic";
@@ -11,8 +12,8 @@ export async function GET(request: NextRequest) {
     const page = parseInt(searchParams.get("page") || "1", 10);
     const source = searchParams.get("source"); // "db" or "live"
 
-    // Try DB first (fast), unless source=live is specified
-    if (source !== "live") {
+    // Try DB first (fast), unless source=live or DB unavailable
+    if (source !== "live" && isDbAvailable()) {
       try {
         const dbResult = await getCategoryMoviesFromDB(category, page);
         if (dbResult.movies.length > 0) {
@@ -27,7 +28,7 @@ export async function GET(request: NextRequest) {
           });
         }
       } catch {
-        // DB not ready, fall through to live
+        // DB query failed, fall through to live
       }
     }
 
