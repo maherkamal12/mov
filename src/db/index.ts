@@ -14,10 +14,20 @@ let pool: Pool | null = null;
 let _db: ReturnType<typeof drizzle> | null = null;
 
 if (databaseUrl) {
+  // For external databases (Supabase, Neon, etc.) we need SSL
+  // Supabase requires sslmode=require, Neon requires sslmode=require
+  const isExternalDb =
+    databaseUrl.includes("supabase") ||
+    databaseUrl.includes("neon") ||
+    databaseUrl.includes("railway") ||
+    databaseUrl.includes("render") ||
+    !databaseUrl.includes("127.0.0.1");
+
   pool =
     globalForDb.__arenaNextJsPostgresqlPool ??
     new Pool({
       connectionString: databaseUrl,
+      ssl: isExternalDb ? { rejectUnauthorized: false } : undefined,
     });
 
   if (process.env.NODE_ENV !== "production") {
