@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { db } from "@/db";
+import { db, isDbAvailable } from "@/db";
 import { categories, movies, movieCategories } from "@/db/schema";
 import { scrapeMoviesPage, SOURCE_CATEGORIES } from "@/lib/scraper";
 import { eq, and, sql } from "drizzle-orm";
@@ -12,7 +12,7 @@ export const dynamic = "force-dynamic";
  * Body: { pagesPerCategory?: number }  (default: 5 pages per call)
  */
 export async function POST(request: NextRequest) {
-  if (!db) {
+  if (!isDbAvailable() || !db) {
     return NextResponse.json(
       { success: false, error: "Database is not configured. Set DATABASE_URL." },
       { status: 503 }

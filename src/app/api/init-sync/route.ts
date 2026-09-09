@@ -1,29 +1,32 @@
 import { NextResponse } from "next/server";
-import { isDbAvailable } from "@/db";
-import { syncCategoryPage, getDBStats } from "@/lib/syncService";
-import { SOURCE_CATEGORIES } from "@/lib/scraper";
+import { isDbAvailable, getDDLPool, db } from "@/db";
+import { categories, movies, movieCategories } from "@/db/schema";
+import { scrapeMoviesPage, SOURCE_CATEGORIES } from "@/lib/scraper";
+import { eq, sql } from "drizzle-orm";
 
 export const dynamic = "force-dynamic";
 
 /**
  * GET /api/init-sync
- * Syncs the first page of EVERY category to populate the homepage quickly.
+ * Creates tables if needed, then syncs page 1 of every category.
  */
 export async function GET() {
-  if (!isDbAvailable()) {
-    return NextResponse.json({
-      success: false,
-      error: "Database is not configured. Set DATABASE_URL.",
-      data: { totalMovies: 0, totalCategories: 0, totalLinks: 0 },
-    });
+  if (!isDbAvailable() || !db) {
+    return NextResponse.json(
+      { success: false, error: "DATABASE_URL is not set. Add it in Vercel Environment Variables." },
+      { status: 503 }
+    );
   }
 
+  const steps: string[] = [];
+
   try {
-    // Auto-create tables if they don't exist
-    const { pool } = await import("@/db");
-    if (pool) {
-      const client = await pool.connect();
+    // Step 1: Auto-create tables using DDL pool (direct connection for Supabase)
+    const ddlPool = getDDLPool();
+    if (ddlPool) {
+      const client = await ddlPool.connect();
       try {
+        await client.query("BEGIN");
         await client.query(`CREATE TABLE IF NOT EXISTS categories (
           id SERIAL PRIMARY KEY, slug TEXT NOT NULL, name TEXT NOT NULL, name_ar TEXT NOT NULL,
           total_pages INTEGER NOT NULL DEFAULT 1, last_scraped_page INTEGER NOT NULL DEFAULT 0,
@@ -46,47 +49,103 @@ export async function GET() {
           id SERIAL PRIMARY KEY, category_slug TEXT NOT NULL, page INTEGER NOT NULL DEFAULT 1,
           movies_count INTEGER NOT NULL DEFAULT 0, scraped_at TIMESTAMP DEFAULT NOW()
         )`);
+        await client.query("COMMIT");
+        steps.push("✅ Tables created successfully");
+      } catch (e) {
+        await client.query("ROLLBACK");
+        const msg = e instanceof Error ? e.message : "unknown";
+        steps.push(`⚠️ Table creation issue: ${msg}`);
       } finally {
         client.release();
       }
     }
 
-    const stats = await getDBStats();
-
-    // If we already have movies, skip
-    if (stats.totalMovies > 0) {
-      return NextResponse.json({
-        success: true,
-        message: "Database already populated",
-        data: stats,
-      });
+    // Step 2: Check if already has data
+    try {
+      const countResult = await db.select({ count: sql<number>`count(*)::int` }).from(movies);
+      const existing = countResult[0]?.count || 0;
+      if (existing > 100) {
+        steps.push(`✅ DB already has ${existing} movies`);
+        return NextResponse.json({
+          success: true,
+          message: `Database already has ${existing} movies. Visit /api/sync-all to add more.`,
+          steps,
+          totalMovies: existing,
+        });
+      }
+    } catch {
+      steps.push("⚠️ Could not count movies, will sync anyway");
     }
 
-    // Sync page 1 of each category
-    const results: Record<string, { count: number; totalPages: number }> = {};
+    // Step 3: Sync page 1 of each category
+    let totalSynced = 0;
+    const syncErrors: string[] = [];
 
     for (const cat of SOURCE_CATEGORIES) {
       try {
-        const result = await syncCategoryPage(cat.slug, 1);
-        results[cat.slug] = result;
+        const result = await scrapeMoviesPage(cat.slug, 1);
+
+        // Upsert category
+        try {
+          await db.insert(categories).values({
+            slug: cat.slug, name: cat.name, nameAr: cat.nameAr, totalPages: result.totalPages,
+          });
+        } catch {
+          try {
+            await db.update(categories).set({ totalPages: result.totalPages, updatedAt: new Date() }).where(eq(categories.slug, cat.slug));
+          } catch { /* ignore */ }
+        }
+
+        // Upsert each movie
+        for (let j = 0; j < result.movies.length; j++) {
+          const movie = result.movies[j];
+          try {
+            await db.insert(movies).values({
+              vid: movie.vid, title: movie.title, image: movie.image,
+              duration: movie.duration, year: movie.year, sourceUrl: movie.sourceUrl,
+            });
+          } catch {
+            try {
+              await db.update(movies).set({
+                title: movie.title, image: movie.image, duration: movie.duration,
+                year: movie.year, updatedAt: new Date(),
+              }).where(eq(movies.vid, movie.vid));
+            } catch { /* ignore */ }
+          }
+          try {
+            await db.insert(movieCategories).values({
+              movieVid: movie.vid, categorySlug: cat.slug, position: j,
+            });
+          } catch { /* link already exists */ }
+        }
+
+        totalSynced += result.movies.length;
       } catch (err) {
-        console.error(`Error syncing ${cat.slug}:`, err);
-        results[cat.slug] = { count: 0, totalPages: 0 };
+        syncErrors.push(`${cat.slug}: ${err instanceof Error ? err.message : "failed"}`);
       }
     }
 
-    const newStats = await getDBStats();
+    steps.push(`✅ Synced ${totalSynced} movies`);
+    if (syncErrors.length > 0) {
+      steps.push(`⚠️ ${syncErrors.length} errors: ${syncErrors.slice(0, 3).join(", ")}`);
+    }
+
+    // Final count
+    let finalCount = 0;
+    try {
+      const c = await db.select({ count: sql<number>`count(*)::int` }).from(movies);
+      finalCount = c[0]?.count || 0;
+    } catch { /* ignore */ }
 
     return NextResponse.json({
       success: true,
-      message: "Initial sync complete",
-      data: { results, stats: newStats },
+      message: `Done! ${totalSynced} movies synced. Total in DB: ${finalCount}. Visit /api/sync-all to load more.`,
+      steps,
+      totalMovies: finalCount,
     });
   } catch (error) {
-    console.error("Error in init-sync:", error);
-    return NextResponse.json(
-      { success: false, error: error instanceof Error ? error.message : "Unknown error" },
-      { status: 500 }
-    );
+    const msg = error instanceof Error ? error.message : "Unknown error";
+    steps.push(`❌ Error: ${msg}`);
+    return NextResponse.json({ success: false, error: msg, steps }, { status: 500 });
   }
 }
