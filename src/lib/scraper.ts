@@ -23,19 +23,48 @@ export async function scrapeMoviesPage(
 ): Promise<ScrapedPage> {
   const url = `${BASE_URL}/category.php?cat=${category}&page=${page}`;
 
-  const response = await fetch(url, {
-    headers: {
-      "User-Agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-      Accept:
-        "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-      "Accept-Language": "ar,en-US;q=0.7,en;q=0.3",
-    },
-    next: { revalidate: 3600 }, // Cache for 1 hour
-  });
+  const headers = {
+    "User-Agent":
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    Accept:
+      "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+    "Accept-Language": "ar,en-US;q=0.7,en;q=0.3",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Cache-Control": "no-cache",
+    Pragma: "no-cache",
+    Referer: `${BASE_URL}/`,
+      Cookie: "cf_clearance=; PHPSESSID=",
+  };
 
-  if (!response.ok) {
-    throw new Error(`Failed to fetch ${url}: ${response.status}`);
+  // Remove Next.js cache control for server-side fetch on Vercel
+  let response: Response | null = null;
+  let lastError: Error | null = null;
+
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      response = await fetch(url, {
+        headers,
+        signal: AbortSignal.timeout(20000),
+      });
+      if (response.ok) break;
+      // If we get 403/503, wait and retry
+      if ((response.status === 403 || response.status === 503) && attempt < 3) {
+        await new Promise((r) => setTimeout(r, 2000 * attempt));
+        continue;
+      }
+    } catch (e) {
+      lastError = e instanceof Error ? e : new Error(String(e));
+      if (attempt < 3) {
+        await new Promise((r) => setTimeout(r, 2000 * attempt));
+        continue;
+      }
+    }
+  }
+
+  if (!response || !response.ok) {
+    throw new Error(
+      `Failed to fetch ${url}: ${response?.status || "no response"} - ${lastError?.message || ""}`
+    );
   }
 
   const html = await response.text();

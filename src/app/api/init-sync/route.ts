@@ -124,6 +124,10 @@ export async function GET() {
         totalSynced += result.movies.length;
       } catch (err) {
         syncErrors.push(`${cat.slug}: ${err instanceof Error ? err.message : "failed"}`);
+        // Only log first 5 errors in detail
+        if (syncErrors.length <= 5) {
+          steps.push(`❌ ${cat.slug}: ${err instanceof Error ? err.message : "failed"}`);
+        }
       }
     }
 
