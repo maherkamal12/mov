@@ -1,6 +1,5 @@
 import { scrapeMoviesPage, SOURCE_CATEGORIES, type ScrapedMovie } from "@/lib/scraper";
-import { isDbAvailable } from "@/db";
-import { getCategoryMoviesFromDB } from "@/lib/syncService";
+import { isDbAvailable, pool } from "@/db";
 import CategoryClient from "./CategoryClient";
 
 interface PageProps {
@@ -21,24 +20,44 @@ export default async function CategoryPage({ params, searchParams }: PageProps) 
   const { slug } = await params;
   const { page: pageStr } = await searchParams;
   const page = Math.max(1, parseInt(pageStr || "1", 10) || 1);
-
   const cat = SOURCE_CATEGORIES.find((c) => c.slug === slug);
   const nameAr = cat?.nameAr || slug;
 
   let movies: ScrapedMovie[] = [];
   let totalPages = 1;
+  const perPage = 40;
 
   // Try DB first
-  if (isDbAvailable()) {
+  if (isDbAvailable() && pool) {
     try {
-      const dbResult = await getCategoryMoviesFromDB(slug, page, 40);
-      if (dbResult.movies.length > 0) {
-        movies = dbResult.movies;
-        totalPages = dbResult.totalPages;
+      const client = await pool.connect();
+      try {
+        const countRes = await client.query(
+          `SELECT count(*)::int as c FROM movie_categories WHERE category_slug = $1`,
+          [slug]
+        );
+        const total = countRes.rows[0]?.c || 0;
+        if (total > 0) {
+          totalPages = Math.max(1, Math.ceil(total / perPage));
+          const offset = (page - 1) * perPage;
+          const moviesRes = await client.query(
+            `SELECT m.vid, m.title, m.image, m.duration, m.year, m.source_url
+             FROM movie_categories mc JOIN movies m ON mc.movie_vid = m.vid
+             WHERE mc.category_slug = $1
+             ORDER BY m.year DESC NULLS LAST, mc.position ASC
+             LIMIT $2 OFFSET $3`,
+            [slug, perPage, offset]
+          );
+          movies = moviesRes.rows.map((r: Record<string, unknown>) => ({
+            vid: String(r.vid), title: String(r.title), image: r.image ? String(r.image) : "",
+            duration: r.duration ? String(r.duration) : "", sourceUrl: r.source_url ? String(r.source_url) : "",
+            year: r.year as number | null,
+          }));
+        }
+      } finally {
+        client.release();
       }
-    } catch {
-      // DB not ready
-    }
+    } catch { /* DB failed */ }
   }
 
   // Fallback: live scrape
@@ -52,13 +71,5 @@ export default async function CategoryPage({ params, searchParams }: PageProps) 
     }
   }
 
-  return (
-    <CategoryClient
-      slug={slug}
-      nameAr={nameAr}
-      initialMovies={movies}
-      initialTotalPages={totalPages}
-      initialPage={page}
-    />
-  );
+  return <CategoryClient slug={slug} nameAr={nameAr} initialMovies={movies} initialTotalPages={totalPages} initialPage={page} />;
 }

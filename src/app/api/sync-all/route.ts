@@ -1,18 +1,15 @@
 import { NextRequest, NextResponse } from "next/server";
-import { db, isDbAvailable } from "@/db";
-import { categories, movies, movieCategories } from "@/db/schema";
+import { isDbAvailable, pool } from "@/db";
 import { scrapeMoviesPage, SOURCE_CATEGORIES } from "@/lib/scraper";
-import { eq, and, sql } from "drizzle-orm";
 
 export const dynamic = "force-dynamic";
 
 /**
  * POST /api/sync-all
- * Syncs multiple pages across categories. Call repeatedly to progress.
- * Body: { pagesPerCategory?: number }  (default: 5 pages per call)
+ * Syncs more pages using raw SQL (works with Supabase PgBouncer).
  */
 export async function POST(request: NextRequest) {
-  if (!isDbAvailable() || !db) {
+  if (!isDbAvailable() || !pool) {
     return NextResponse.json(
       { success: false, error: "Database is not configured. Set DATABASE_URL." },
       { status: 503 }
@@ -21,29 +18,32 @@ export async function POST(request: NextRequest) {
 
   try {
     const body = await request.json().catch(() => ({}));
-    const pagesPerCategory =
-      (body as { pagesPerCategory?: number }).pagesPerCategory || 5;
+    const pagesPerCategory = (body as { pagesPerCategory?: number }).pagesPerCategory || 5;
 
     const progress: Record<string, { synced: number; total: number; newMovies: number }> = {};
     let totalNew = 0;
 
     for (const cat of SOURCE_CATEGORIES) {
-      const existing = await db
-        .select()
-        .from(categories)
-        .where(eq(categories.slug, cat.slug))
-        .limit(1);
-
-      let lastPage = existing[0]?.lastScrapedPage || 0;
-      let totalPages = existing[0]?.totalPages || 1;
-
-      if (existing.length === 0) {
-        await db.insert(categories).values({
-          slug: cat.slug,
-          name: cat.name,
-          nameAr: cat.nameAr,
-          totalPages: 1,
-        });
+      // Get category state
+      const c1 = await pool.connect();
+      let lastPage = 0;
+      let totalPages = 1;
+      try {
+        const res = await c1.query(
+          `SELECT total_pages, last_scraped_page FROM categories WHERE slug = $1`,
+          [cat.slug]
+        );
+        if (res.rows.length > 0) {
+          totalPages = res.rows[0].total_pages || 1;
+          lastPage = res.rows[0].last_scraped_page || 0;
+        } else {
+          await c1.query(
+            `INSERT INTO categories (slug, name, name_ar, total_pages) VALUES ($1, $2, $3, 1) ON CONFLICT (slug) DO NOTHING`,
+            [cat.slug, cat.name, cat.nameAr]
+          );
+        }
+      } finally {
+        c1.release();
       }
 
       let synced = 0;
@@ -60,65 +60,45 @@ export async function POST(request: NextRequest) {
             totalPages = result.totalPages;
           }
 
-          await db
-            .update(categories)
-            .set({
-              totalPages,
-              lastScrapedPage: nextPage,
-              updatedAt: new Date(),
-            })
-            .where(eq(categories.slug, cat.slug));
+          // Update category and insert movies in one connection
+          const c2 = await pool.connect();
+          try {
+            await c2.query("BEGIN");
 
-          for (let j = 0; j < result.movies.length; j++) {
-            const movie = result.movies[j];
+            await c2.query(
+              `UPDATE categories SET total_pages = $1, last_scraped_page = $2, updated_at = NOW() WHERE slug = $3`,
+              [totalPages, nextPage, cat.slug]
+            );
 
-            const movieExists = await db
-              .select({ vid: movies.vid })
-              .from(movies)
-              .where(eq(movies.vid, movie.vid))
-              .limit(1);
+            for (let j = 0; j < result.movies.length; j++) {
+              const movie = result.movies[j];
 
-            if (movieExists.length === 0) {
-              await db.insert(movies).values({
-                vid: movie.vid,
-                title: movie.title,
-                image: movie.image,
-                duration: movie.duration,
-                year: movie.year,
-                sourceUrl: movie.sourceUrl,
-              });
-              newMovies++;
-            } else {
-              await db
-                .update(movies)
-                .set({
-                  title: movie.title,
-                  image: movie.image,
-                  duration: movie.duration,
-                  year: movie.year,
-                  updatedAt: new Date(),
-                })
-                .where(eq(movies.vid, movie.vid));
+              const exists = await c2.query(`SELECT vid FROM movies WHERE vid = $1`, [movie.vid]);
+              if (exists.rows.length === 0) {
+                await c2.query(
+                  `INSERT INTO movies (vid, title, image, duration, year, source_url) VALUES ($1, $2, $3, $4, $5, $6)`,
+                  [movie.vid, movie.title, movie.image, movie.duration, movie.year, movie.sourceUrl]
+                );
+                newMovies++;
+              } else {
+                await c2.query(
+                  `UPDATE movies SET title = $2, image = $3, duration = $4, year = $5, updated_at = NOW() WHERE vid = $1`,
+                  [movie.vid, movie.title, movie.image, movie.duration, movie.year]
+                );
+              }
+
+              await c2.query(
+                `INSERT INTO movie_categories (movie_vid, category_slug, position) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
+                [movie.vid, cat.slug, (nextPage - 1) * 40 + j]
+              );
             }
 
-            const linkExists = await db
-              .select()
-              .from(movieCategories)
-              .where(
-                and(
-                  eq(movieCategories.movieVid, movie.vid),
-                  eq(movieCategories.categorySlug, cat.slug)
-                )
-              )
-              .limit(1);
-
-            if (linkExists.length === 0) {
-              await db.insert(movieCategories).values({
-                movieVid: movie.vid,
-                categorySlug: cat.slug,
-                position: (nextPage - 1) * 40 + j,
-              });
-            }
+            await c2.query("COMMIT");
+          } catch (e) {
+            await c2.query("ROLLBACK");
+            throw e;
+          } finally {
+            c2.release();
           }
 
           lastPage = nextPage;
@@ -132,22 +112,24 @@ export async function POST(request: NextRequest) {
       totalNew += newMovies;
     }
 
-    const movieCount = await db
-      .select({ count: sql<number>`count(*)::int` })
-      .from(movies);
-    const catCount = await db
-      .select({ count: sql<number>`count(*)::int` })
-      .from(categories);
-    const linkCount = await db
-      .select({ count: sql<number>`count(*)::int` })
-      .from(movieCategories);
+    // Get stats
+    const c3 = await pool.connect();
+    let movieCount = 0;
+    let linkCount = 0;
+    try {
+      const r1 = await c3.query(`SELECT count(*)::int as c FROM movies`);
+      movieCount = r1.rows[0]?.c || 0;
+      const r2 = await c3.query(`SELECT count(*)::int as c FROM movie_categories`);
+      linkCount = r2.rows[0]?.c || 0;
+    } finally {
+      c3.release();
+    }
 
     return NextResponse.json({
       success: true,
       data: {
-        totalMovies: movieCount[0]?.count || 0,
-        totalCategories: catCount[0]?.count || 0,
-        totalLinks: linkCount[0]?.count || 0,
+        totalMovies: movieCount,
+        totalLinks: linkCount,
         newThisRun: totalNew,
         progress,
       },
@@ -155,10 +137,7 @@ export async function POST(request: NextRequest) {
   } catch (error) {
     console.error("Error in sync-all:", error);
     return NextResponse.json(
-      {
-        success: false,
-        error: error instanceof Error ? error.message : "Unknown error",
-      },
+      { success: false, error: error instanceof Error ? error.message : "Unknown error" },
       { status: 500 }
     );
   }
